@@ -1,0 +1,432 @@
+/*
+ *  Author: Anonymous
+ *  Model Name: lightning
+ *  Comment: Model of path integrity for the lightning payment protocol
+ */
+
+theory lightning  
+
+begin
+
+builtins: multiset
+
+functions: senc/2
+           , sdec/2
+           , aenc/2
+           , adec/2
+           , pk/1
+           , sign/2
+           , verify/3
+           , true/0
+           , h/1
+           , Wrapped/1 [private] // Used to mitigate partial sources
+equations: sdec(senc(m, x), x) = m,
+           verify(sign(m, k), m, pk(k)) = true,
+           adec(aenc(m, pk(x)), x) = m
+
+/*
+  We adopt the following syntax throughout:
+
+  Fact Naming Conventions:
+    - Standard facts are Capitalised
+    - Facts used as part of a restriction
+        (whether event or linear) are FULLCAPS
+    - (Event) facts used only as part of helper or check lemmas
+        are ended with Suffixes__()
+
+  Usage:
+    - We recommend use of an oracle file, command e.g.:
+      time tamarin-prover\
+        simpleOnion.spthy\
+        --heuristic=O --oraclename=pi-oracle.py\
+        --prove +RTS -N6 -RTS
+    
+    - For interactive mode:
+        tamarin-prover interactive\
+          simpleOnion.spthy\
+          --heuristic=O --oraclename=pi-oracle.py\
+          +RTS -N6 -RTS
+    
+    - Where N6 is the number of cores to be used
+
+*/
+
+// ******************************************* //
+// ------------- Protocol Rules -------------- //
+// ******************************************* //
+
+// ---------------------------- //
+// - Boundedness Restrictions - //
+// ---------------------------- //
+// This rule assigns "tokens" to be used by most other rules
+// This ensures that certain steps can only run a certain number
+// of times, and thus bounds our analysis.
+
+rule Bound_Tokens:
+  [  ]
+--[
+    ONCE('bounds')
+  ]->
+  [
+    // 4 agents
+    LTK_COUNTER('1')
+    // 1 session
+    , CREATE_TOKEN()
+    , SEND_TOKEN()
+    , RECEIVE_TOKEN()
+    // 3 intermediates
+    , WRAP_COUNTER('1')
+    , UNWRAP_COUNTER('1')
+  ]
+
+// ---------------------------- //
+// ----------- Setup ---------- //
+// ---------------------------- //
+/*
+  We model the chained encryption as using
+  public-key style encryption to store per-hop
+  data, with individual channels secured using
+  symmetric keys.
+
+  In the GenKey rule we assign a public key
+  to the second agent in the pair (since the
+  initiator does not need to encrypt using one)
+
+  Combining this key generation is mostly for
+  convenience - we could use two separate rules
+  if so desired
+*/
+
+rule Gen_ShKey [colour=ffffff]:  
+  [
+    Fr(~shkey) 
+    , Fr(~ltk)
+    , LTK_COUNTER(pre)
+  ]
+--[
+    ONCE(<'key', $A, $B>)
+    , ENFORCE_LTK_COUNTER(pre)
+  ]->
+  [ 
+    !ShKey($A, $B, ~shkey)
+    , !Pk($B, pk(~ltk))
+    , !Ltk($B, ~ltk)
+    , Out(pk(~ltk))
+    , LTK_COUNTER(pre+'1')
+  ]
+
+
+// ---------------------------- //
+// -------- Corruption -------- //
+// ---------------------------- //
+
+// ---------------------------- //
+// ------- Construction ------- //
+// ---------------------------- //
+
+rule Create [colour=8888ff]:
+  let
+    identifier = h(~p)
+    perhop = aenc('fin', pkE)
+    msg = <identifier, perhop>
+  in
+  [
+    CREATE_TOKEN()
+    , Fr(~p)
+    , !ShKey($A, $E, ~shkey)
+    , !Pk($E, pkE)
+  ]
+--[
+    StartBuild($A, ~p)
+    , Add(~p, $E, identifier, 'fin')
+    , ADD_AGENT(~p, $E)
+  ]->
+  [
+    Build(~p, $A, $E, msg)
+  ]
+
+// Adding C to the path
+// Require that C's perhop indicates he should send to D
+rule Wrap [colour=9999ff]:
+  let
+    beforemsg = <identifier, beforeperhop>
+    afterperhop = aenc(<$D, beforeperhop>, pkC)
+    aftermsg = <identifier, afterperhop>
+  in
+  [
+    WRAP_COUNTER(pre)
+    , Build(~p, $A, $D, beforemsg)
+    , !ShKey($B, $C, ~kBC)
+    , !ShKey($C, $D, ~kCD)
+    , !Pk($C, pkC)
+  ]
+--[
+    Add(~p, $M, afterperhop, beforeperhop)
+    , ENFORCE_WRAP_COUNTER(pre)
+    , ADD_AGENT(~p, $M)
+  ]->
+  [
+    Build(~p, $A, $C, aftermsg),
+    WRAP_COUNTER(pre+'1')
+  ]
+
+rule Send [colour=aaaaff]:
+  let
+    encmessage = senc(message, ~kAB)
+  in
+  [
+    Build(~p, $A, $M, message)
+    , !ShKey($A, $B, ~kAB)
+    , SEND_TOKEN()
+  ]
+--[
+  ]->
+  [
+    Out(Wrapped(encmessage))
+    , InitState($A, ~p)
+  ]
+
+// ---------------------------- //
+// -------- Forwarding -------- //
+// ---------------------------- //
+
+rule Unwrap [colour=aaffaa]:
+  let
+    perhopC = aenc(<$D, perhopD>, pk(~ltkC))
+    message = <identifier, perhopC >
+    inmsg = senc(message, ~kBC)
+    outmessage = senc(<identifier, perhopD>, ~kCD)
+  in
+  [
+    In(Wrapped(inmsg))
+    , UNWRAP_COUNTER(pre)
+    , !ShKey($B, $C, ~kBC)
+    , !ShKey($C, $D, ~kCD)
+    , !Ltk($C, ~ltkC)
+  ]
+--[
+    Forward($M, identifier, identifier)
+    , ENFORCE_UNWRAP_COUNTER(pre)
+  ]->
+  [
+    Out(Wrapped(outmessage))
+    , UNWRAP_COUNTER(pre+'1')
+    , ForwardState($C, identifier)
+  ]
+
+// ---------------------------- //
+// --------- Receive ---------- //
+// ---------------------------- //
+
+rule Reply[colour=aaffaa]:
+  let
+    perhopE = aenc('fin', pk(~ltkE))
+    message = <h(x), perhopE>
+    inmsg = senc(message, ~kDE)
+    outmsg = senc(x, ~kDE)
+  in
+  [
+    RECEIVE_TOKEN()
+    , In(Wrapped(inmsg))
+    , !ShKey($D, $E, ~kDE)
+    , !Ltk($E, ~ltkE)
+  ]
+--[
+    Forward($E, h(x), 'fin')
+    , Backward($E, x, x)
+    , Reachable__()
+  ]->
+  [
+    Out(outmsg)
+  ]
+
+// ---------------------------- //
+// ------- Return Path -------- //
+// ---------------------------- //
+
+rule Backward[colour=aaddaa]:
+  let
+    inmsg = senc(x, ~kCD)
+    outmsg = senc(x, ~kBC)
+  in
+  [
+    In(inmsg)
+    , !ShKey($B, $C, ~kBC)
+    , !ShKey($C, $D, ~kCD)
+    , ForwardState($C, h(x))
+  ]
+--[  
+    Backward($C, x, x)
+  ]->
+  [
+    Out(outmsg)
+  ]
+
+rule Finish[colour=eeeeff]:
+  let
+    inmsg = senc(~p, ~kAB)
+  in
+  [
+    In(inmsg)
+    , !ShKey($A, $B, ~kAB)
+    , InitState($A, ~p)
+  ]
+--[
+
+  ]->
+  [
+
+  ]
+
+
+// ******************************************* //
+// --------- Restrictions and Lemmas --------- //
+// ******************************************* //
+
+// ---------------------------- //
+// ------- Restrictions ------- //
+// ---------------------------- //
+
+// One key per person, one token allocation
+restriction once:
+"
+  All type #t1 #t2.
+    ONCE(type)@t1 &
+    ONCE(type)@t2
+  ==>
+    (#t1 = #t2)
+"
+
+// Agents not repeated on path
+restriction pathOrderWellFormed:
+"
+  All pid A #ta #tb.
+    ADD_AGENT(pid, A)@ta &
+    ADD_AGENT(pid, A)@tb
+  ==>
+    (#ta = #tb)
+"
+
+// Equality (e.g. in signature schemes)
+restriction equal:
+"
+  All l r #t.
+    EQUAL(l, r)@t ==> l = r
+"
+
+// The counter starts at '1'
+// This is a pre-check (it is incremented as part of the rule)
+// So this restriction will prevent the fifth call to Gen_Ltk
+restriction ltk_counter:
+"
+  All counter #t.
+    ENFORCE_LTK_COUNTER(counter)@t
+  ==>
+  Ex z. counter + z = '1'+'1'+'1'+'1'//+'1'
+"
+
+// The counter starts at '1'
+// This is a pre-check (it is incremented as part of the rule)
+// So this restriction will prevent the fourth call to Wrap
+restriction wrap_counter:
+"
+  All counter #t.
+    ENFORCE_WRAP_COUNTER(counter)@t
+  ==>
+  Ex z. counter + z = '1'+'1'+'1'//+'1'
+"
+
+// The counter starts at '1'
+// This is a pre-check (it is incremented as part of the rule)
+// So this restriction will prevent the fourth call to Forward
+restriction unwrap_counter:
+"
+  All counter #t.
+    ENFORCE_UNWRAP_COUNTER(counter)@t
+  ==>
+  Ex z. counter + z = '1'+'1'+'1'//+'1'
+"
+
+// ---------------------------- //
+// ------- Sanity Lemmas ------ //
+// ---------------------------- //
+
+lemma reachable:
+exists-trace
+"
+  Ex #t. Reachable__()@t
+"
+
+// ---------------------------- //
+// ------ Security Lemmas ----- //
+// ---------------------------- //
+
+lemma path_integrity:
+all-traces
+"
+  All A Mi Mj pid // Agents
+    fi ti fj tj // From- and to- terms
+    #tai #taj #tki #ts. // times
+  
+  StartBuild(A, pid)@ts
+  & Add(pid, Mi, fi, ti)@tai
+  & Add(pid, Mj, fj, tj)@taj
+  // A is not corrupt?
+  & (#tai < taj) // Path order established
+  & (
+      ( Forward(Mi, fi, ti)@tki ) // Mi forwarded the message properly
+    )
+  ==> 
+  ( // Either
+    ( Ex #tkj.
+        (#tkj < #tki)
+      &  Forward(Mj, fj, tj)@tkj 
+    ) | // Mj forwarded the message properly
+    ( // Mj is corrupt and the adversary readily could have forwarded
+      Ex #tkj #tcj.
+        (#tkj < #tki)
+        & Corrupt(Mj)@tcj
+        & K(<Wrapped(fj), Wrapped(tj)>)@tkj
+    )      
+  )
+"
+
+lemma path_symmetry_honest:
+all-traces
+"
+  All Mi Mj // Agents
+    fi tj ti x y // From- and to- terms
+    #tfi #tfj #tri.
+    (not Ex #tcj. Corrupt(Mj)@tcj)
+    & Forward(Mj, x, tj)@tfj // Mj forwarded message
+    & (#tfi < #tfj) // Mi < Mj
+    & (#tfj < #tri)
+    & Forward(Mi, fi, x)@tfi
+    & Backward(Mi, y, ti)@tri
+  ==>
+  Ex fj #trj.
+    (#tfj < #trj)
+    & (#trj < #tri)
+    & Backward(Mj, fj, y)@trj
+"
+
+lemma path_symmetry_corrupt:
+all-traces
+"
+  All Mi Mj // Agents
+    fi tj ti x y // From- and to- terms
+    #tfi #tfj #tri #tci. 
+    (not Ex #tcj. Corrupt(Mj)@tcj)
+    & Forward(Mj, x, tj)@tfj // Mj forwarded message
+    & (#tfi < #tfj) // Mi < Mj
+    & (#tfj < #tri)
+    & Corrupt(Mi)@tci
+    & K(<fi, x>)@tfi
+    & K(<y, ti>)@tri
+  ==>
+  Ex fj #trj.
+    (#tfj < #trj)
+    & (#trj < #tri)
+    & Backward(Mj, fj, y)@trj
+"
+end

@@ -1,0 +1,9 @@
+## Excess Tamarin execution files
+*.sh
+*.aes
+
+tamarin-python.logging.py
+
+## Excess files from protocol diagrams
+*.tex
+*.eps

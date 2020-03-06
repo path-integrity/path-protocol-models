@@ -1,0 +1,339 @@
+/*
+ *  Author: Anonymous
+ *  Model Name: mbTLS
+ *  Comment: Model of path integrity for a middlebox-enabled TLS variant
+ */
+
+theory mbTLS  
+
+begin
+
+builtins: multiset
+
+functions: senc/2
+           , sdec/2
+           , Wrapped/1 [private] // Used to mitigate partial sources
+equations: sdec(senc(m, k), k) = m
+
+/*
+  We adopt the following syntax throughout:
+
+  Fact Naming Conventions:
+    - Standard facts are Capitalised
+    - Facts used as part of a restriction
+        (whether event or linear) are FULLCAPS
+    - (Event) facts used only as part of helper or check lemmas
+        are ended with Suffixes__()
+
+  Usage:
+    - We recommend use of an oracle file, command e.g.:
+      time tamarin-prover\
+        simpleOnion.spthy\
+        --heuristic=O --oraclename=pi-oracle.py\
+        --prove +RTS -N6 -RTS
+    
+    - For interactive mode:
+        tamarin-prover interactive\
+          simpleOnion.spthy\
+          --heuristic=O --oraclename=pi-oracle.py\
+          +RTS -N6 -RTS
+    
+    - Where N6 is the number of cores to be used
+
+*/
+
+// ******************************************* //
+// ------------- Protocol Rules -------------- //
+// ******************************************* //
+
+// ---------------------------- //
+// - Boundedness Restrictions - //
+// ---------------------------- //
+// This rule assigns "tokens" to be used by most other rules
+// This ensures that certain steps can only run a certain number
+// of times, and thus bounds our analysis.
+
+rule Bound_Tokens:
+  [  ]
+--[
+    ONCE('bounds')
+  ]->
+  [
+    // 4 agents
+    LTK_COUNTER('1')
+    // 1 session
+    , CREATE_TOKEN()
+    , SEND_TOKEN()
+    , RECEIVE_TOKEN()
+    // 3 intermediates
+    , WRAP_COUNTER('1')
+    , UNWRAP_COUNTER('1')
+  ]
+
+// ---------------------------- //
+// ----------- Setup ---------- //
+// ---------------------------- //
+
+rule Gen_ShKey [colour=ffffff]:  
+  [
+    Fr(~ltk) 
+    , LTK_COUNTER(pre)
+  ]
+--[
+    ONCE(<'key', $A, $B>)
+    , ENFORCE_LTK_COUNTER(pre)
+  ]->
+  [ 
+    !ShKey($A, $B, ~ltk)
+    , LTK_COUNTER(pre+'1')
+  ]
+
+
+// ---------------------------- //
+// -------- Corruption -------- //
+// ---------------------------- //
+
+rule Skip_Corrupt [colour=ffaaaa]:
+  let
+    before = senc(~p, ~kBC)
+    after = senc(~p, ~kDE)
+  in
+  [
+    In(Wrapped(before))
+    , !ShKey($B, $C, ~kBC)
+    , !ShKey($D, $E, ~kDE)
+    , UNWRAP_COUNTER(pre)
+  ]
+--[
+    Forward($M, ~p, ~p)
+    , ENFORCE_UNWRAP_COUNTER(pre)
+    , Corrupt($C) // Recvd but didn't forward
+    , Corrupt($E) // Accepted off-band communique
+  ]->
+  [
+    Out(<Wrapped(after), Wrapped(before)>)
+    , UNWRAP_COUNTER(pre+'1')
+  ]
+// ---------------------------- //
+// ------- Construction ------- //
+// ---------------------------- //
+
+rule Create [colour=8888ff]:
+  let
+    encmsg = senc(~p, ~k)
+  in
+  [
+    CREATE_TOKEN()
+    , Fr(~p)
+    , !ShKey($D, $E, ~k)
+  ]
+--[
+    StartBuild($A, ~p)
+    , Add(~p, $E, ~p, 'fin')
+    , ADD_AGENT(~p, $E)
+  ]->
+  [
+    Build(~p, $A, $E, encmsg)
+  ]
+
+// Note after and before are "swapped" in the Add fact
+// This is because they represent what the initiating agent
+// believes the message will change from and to
+// i.e. the forwarding agent will reverse this encryption
+// We're climbing backwards in the path
+rule Wrap [colour=9999ff]:
+  let
+    before = senc(~p, ~kCD)
+    after = senc(~p, ~kBC)
+  in
+  [
+     WRAP_COUNTER(pre)
+    , Build(~p, $A, $N, before)
+    , !ShKey($B, $C, ~kBC)
+    , !ShKey($C, $D, ~kCD)
+  ]
+--[
+    Add(~p, $M, ~p, ~p)
+    , ENFORCE_WRAP_COUNTER(pre)
+    , ADD_AGENT(~p, $M)
+  ]->
+  [
+    Build(~p, $A, $M, after),
+    WRAP_COUNTER(pre+'1')
+  ]
+
+rule Send [colour=aaaaff]:
+  let 
+    message = senc(~p, ~kAB)
+  in
+  [
+    Build(~p, $A, $B, message)
+    , SEND_TOKEN()
+    , !ShKey($A, $B, ~kAB)
+  ]
+--[
+  ]->
+  [
+    Out(Wrapped(message))
+  ]
+
+// ---------------------------- //
+// -------- Forwarding -------- //
+// ---------------------------- //
+
+rule Unwrap [colour=aaffaa]:
+  let
+    before = senc(~p, ~kBC)
+    after = senc(~p, ~kCD)
+  in
+  [
+    In(Wrapped(before))
+    , !ShKey($B, $C, ~kBC)
+    , !ShKey($C, $D, ~kCD)
+    , UNWRAP_COUNTER(pre)
+  ]
+--[
+    Forward($M, ~p, ~p)
+    , ENFORCE_UNWRAP_COUNTER(pre)
+  ]->
+  [
+    Out(Wrapped(after))
+    , UNWRAP_COUNTER(pre+'1')
+  ]
+
+// ---------------------------- //
+// --------- Receive ---------- //
+// ---------------------------- //
+
+rule Receive[colour=aaffaa]:
+  let
+    before = senc(~p, ~kDE)
+  in
+  [
+    RECEIVE_TOKEN()
+    , In(Wrapped(before))
+    , !ShKey($D, $E, ~kDE)
+  ]
+--[
+    Forward($E, ~p, 'fin')
+    , Reachable__()
+  ]->
+  [
+
+  ]
+
+
+// ******************************************* //
+// --------- Restrictions and Lemmas --------- //
+// ******************************************* //
+
+// ---------------------------- //
+// ------- Restrictions ------- //
+// ---------------------------- //
+
+// One key per person, one token allocation
+restriction once:
+"
+  All type #t1 #t2.
+    ONCE(type)@t1 &
+    ONCE(type)@t2
+  ==>
+    (#t1 = #t2)
+"
+
+// Agents not repeated on path
+restriction pathOrderWellFormed:
+"
+  All pid A #ta #tb.
+    ADD_AGENT(pid, A)@ta &
+    ADD_AGENT(pid, A)@tb
+  ==>
+    (#ta = #tb)
+"
+
+// Equality (e.g. in signature schemes)
+restriction equal:
+"
+  All l r #t.
+    EQUAL(l, r)@t ==> l = r
+"
+
+// The counter starts at '1'
+// This is a pre-check (it is incremented as part of the rule)
+// So this restriction will prevent the fifth call to Gen_Ltk
+restriction ltk_counter:
+"
+  All counter #t.
+    ENFORCE_LTK_COUNTER(counter)@t
+  ==>
+  Ex z. counter + z = '1'+'1'+'1'+'1'//+'1'
+"
+
+// The counter starts at '1'
+// This is a pre-check (it is incremented as part of the rule)
+// So this restriction will prevent the fourth call to Wrap
+restriction wrap_counter:
+"
+  All counter #t.
+    ENFORCE_WRAP_COUNTER(counter)@t
+  ==>
+  Ex z. counter + z = '1'+'1'+'1'//+'1'
+"
+
+// The counter starts at '1'
+// This is a pre-check (it is incremented as part of the rule)
+// So this restriction will prevent the fourth call to Forward
+restriction unwrap_counter:
+"
+  All counter #t.
+    ENFORCE_UNWRAP_COUNTER(counter)@t
+  ==>
+  Ex z. counter + z = '1'+'1'+'1'//+'1'
+"
+
+// ---------------------------- //
+// ------- Sanity Lemmas ------ //
+// ---------------------------- //
+
+lemma reachable:
+exists-trace
+"
+  Ex #t. Reachable__()@t
+"
+
+// ---------------------------- //
+// ------ Security Lemmas ----- //
+// ---------------------------- //
+
+lemma path_integrity:
+all-traces
+"
+  All A Mi Mj pid // Agents
+    fi ti fj tj // From- and to- terms
+    #tai #taj #tki #ts. // times
+  
+  StartBuild(A, pid)@ts
+  & Add(pid, Mi, fi, ti)@tai
+  & Add(pid, Mj, fj, tj)@taj
+  // A is not corrupt?
+  & (#tai < taj) // Path order established
+  & (
+      ( Forward(Mi, fi, ti)@tki ) // Mi forwarded the message properly
+    )
+  ==> 
+  ( // Either
+    ( Ex #tkj.
+        (#tkj < #tki)
+      &  Forward(Mj, fj, tj)@tkj 
+    ) | // Mj forwarded the message properly
+    ( // Mj is corrupt and the adversary readily could have forwarded
+      Ex #tkj #tcj.
+        (#tkj < #tki)
+        & Corrupt(Mj)@tcj
+        & K(<Wrapped(fj), Wrapped(tj)>)@tkj
+    )      
+  )
+
+"
+
+end
