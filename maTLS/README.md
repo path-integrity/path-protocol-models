@@ -1,7 +1,7 @@
 # maTLS Protocol
 ===========
 
-![maTLS Protocol Diagram](matls.pdf)
+![maTLS Protocol Diagram](matls.jpg)
 
 A model for the maTLS middlebox-enhanced TLS scheme. We examine only the record phase, assuming that the handshake has successfully completed.
 
